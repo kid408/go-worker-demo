@@ -52,9 +52,11 @@ pipeline {
           export NOMAD_ADDR=${NOMAD_ADDR}
           sleep 10
           nomad node status
-          nomad job status worker
-          curl -fsS ${CONSUL_ADDR}/v1/health/service/worker-http?passing=true | jq 'length > 0' | grep true
-          curl -fsS ${CONSUL_ADDR}/v1/health/service/worker-prom?passing=true | jq 'length > 0' | grep true
+          nomad job status -verbose worker
+          curl -fsS ${CONSUL_ADDR}/v1/health/service/worker-http?passing=true | tee /tmp/worker-http.json | jq .
+          jq -e 'length > 0' /tmp/worker-http.json >/dev/null
+          curl -fsS ${CONSUL_ADDR}/v1/health/service/worker-prom?passing=true | tee /tmp/worker-prom.json | jq .
+          jq -e 'length > 0' /tmp/worker-prom.json >/dev/null
         '''
       }
     }
