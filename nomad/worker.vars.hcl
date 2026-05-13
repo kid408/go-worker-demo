@@ -1,5 +1,5 @@
 region                   = "global"
-datacenters              = ["nomad-playground-region-dc"]
+datacenters              = ["dc1"]
 namespace                = "default"
 image                    = "go-worker-demo:dev"
 count                    = 5

@@ -52,6 +52,11 @@ pipeline {
 
           READY_NODE="$(nomad node status -json | jq -r 'map(select(.Status=="ready"))[0].ID // empty')"
           test -n "${READY_NODE}"
+          NODE_DC="$(nomad node status -json | jq -r 'map(select(.Status=="ready"))[0].Datacenter // empty')"
+          test -n "${NODE_DC}"
+          JOB_DC="$(sed -n 's/^datacenters[[:space:]]*=[[:space:]]*\\[\"\\([^\"]*\\)\"\\].*/\\1/p' nomad/worker.vars.hcl)"
+          test -n "${JOB_DC}"
+          test "${NODE_DC}" = "${JOB_DC}"
 
           echo "=== ready node: ${READY_NODE} ==="
           nomad node status -verbose "${READY_NODE}" | tee /tmp/nomad-worker-node.txt
@@ -93,7 +98,7 @@ pipeline {
             echo '=== nomad job status ==='
             nomad job status -verbose worker || true
             echo '=== nomad job allocations ==='
-            nomad job allocations worker || true
+            nomad job allocs worker || true
             echo '=== consul worker-http ==='
             curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-http?passing=true" | jq . || true
             echo '=== consul worker-prom ==='
