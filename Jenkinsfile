@@ -107,9 +107,15 @@ pipeline {
 
           trap 'diagnose' 0
 
+          printf '[]\n' > /tmp/worker-http.json
+          printf '[]\n' > /tmp/worker-prom.json
+
           for _ in $(seq 1 30); do
-            if curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-http?passing=true" | tee /tmp/worker-http.json | jq -e 'length > 0' >/dev/null; then
-              curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-prom?passing=true" | tee /tmp/worker-prom.json | jq -e 'length > 0' >/dev/null
+            curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-http?passing=true" > /tmp/worker-http.json || printf '[]\n' > /tmp/worker-http.json
+            curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-prom?passing=true" > /tmp/worker-prom.json || printf '[]\n' > /tmp/worker-prom.json
+
+            if jq -e 'length > 0' /tmp/worker-http.json >/dev/null 2>&1 &&
+               jq -e 'length > 0' /tmp/worker-prom.json >/dev/null 2>&1; then
               nomad job status -verbose worker
               jq . /tmp/worker-http.json
               jq . /tmp/worker-prom.json
