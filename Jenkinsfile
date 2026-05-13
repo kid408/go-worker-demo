@@ -8,7 +8,7 @@ pipeline {
   environment {
     HOST_APP_PORT = '38081'
     HOST_METRICS_PORT = '32113'
-    HOST_LOG_DIR = '/opt/monitoring/fluent-bit/logs/worker'
+    HOST_LOG_ROOT = '/opt/monitoring/fluent-bit/logs'
   }
 
   stages {
@@ -40,7 +40,6 @@ pipeline {
       steps {
         sh '''
           docker rm -f go-worker-demo || true
-          mkdir -p ${HOST_LOG_DIR}
           docker run -d \
             --name go-worker-demo \
             --restart unless-stopped \
@@ -51,10 +50,10 @@ pipeline {
             -e APP_PORT=18081 \
             -e METRICS_PORT=12113 \
             -e CONSUL_HTTP_ADDR=http://host.docker.internal:8500 \
-            -e APP_LOG_PATH=/app/logs/go-worker-demo.log \
+            -e APP_LOG_PATH=/app/logs/worker/go-worker-demo.log \
             -p ${HOST_APP_PORT}:18081 \
             -p ${HOST_METRICS_PORT}:12113 \
-            -v ${HOST_LOG_DIR}:/app/logs \
+            -v ${HOST_LOG_ROOT}:/app/logs \
             go-worker-demo:latest
         '''
       }
@@ -73,4 +72,3 @@ pipeline {
     }
   }
 }
-
