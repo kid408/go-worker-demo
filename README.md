@@ -2,6 +2,8 @@
 
 `go-worker-demo` 是“处理层”示例服务。
 
+Nomad 部署时不要再用 `latest` 标签。当前示例统一使用 `go-worker-demo:dev`，否则 Docker driver 很容易继续尝试远程拉取。
+
 它的职责是：
 
 1. 在 Consul 中发现 `gateway-http`
@@ -49,4 +51,3 @@ go run .
 ```text
 {job="go-worker-demo"}
 ```
-
