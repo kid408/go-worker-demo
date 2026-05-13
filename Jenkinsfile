@@ -41,7 +41,7 @@ pipeline {
         sh '''
           export NOMAD_ADDR=${NOMAD_ADDR}
           docker rm -f go-worker-demo || true
-          nomad job run -var-file=nomad/worker.vars.hcl nomad/worker.nomad.hcl
+          nomad job run -detach -var-file=nomad/worker.vars.hcl nomad/worker.nomad.hcl
         '''
       }
     }
@@ -51,6 +51,7 @@ pipeline {
         sh '''
           export NOMAD_ADDR=${NOMAD_ADDR}
           sleep 10
+          nomad node status
           nomad job status worker
           curl -fsS ${CONSUL_ADDR}/v1/health/service/worker-http?passing=true | jq 'length > 0' | grep true
           curl -fsS ${CONSUL_ADDR}/v1/health/service/worker-prom?passing=true | jq 'length > 0' | grep true
