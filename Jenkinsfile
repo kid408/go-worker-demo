@@ -70,7 +70,7 @@ pipeline {
       steps {
         sh '''
           set -eu
-          docker buildx build -t go-worker-demo:${IMAGE_TAG} . --load
+          docker buildx build -f Dockerfile -t go-worker-demo:${IMAGE_TAG} . --load
         '''
       }
     }

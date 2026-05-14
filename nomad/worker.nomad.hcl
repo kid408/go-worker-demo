@@ -14,6 +14,7 @@ job "worker" {
 
     network {
       port "http" {}
+      port "grpc" {}
       port "metrics" {}
     }
 
@@ -26,6 +27,19 @@ job "worker" {
         name     = "worker HTTP Check"
         type     = "http"
         path     = "/healthz"
+        interval = "10s"
+        timeout  = "2s"
+      }
+    }
+
+    service {
+      name         = "worker-grpc"
+      tags         = var.discovery_service_tags
+      port         = "grpc"
+      address_mode = "host"
+      check {
+        name     = "worker gRPC TCP Check"
+        type     = "tcp"
         interval = "10s"
         timeout  = "2s"
       }
@@ -64,14 +78,20 @@ job "worker" {
         TZ                            = "Asia/Shanghai"
         SERVICE_NAME                  = "worker"
         TARGET_SERVICE_NAME           = "gateway"
-        TARGET_DISCOVERY_SERVICE_NAME = "gateway-http"
+        TARGET_DISCOVERY_SERVICE_NAME = "gateway-grpc"
         APP_PORT                      = "${NOMAD_PORT_http}"
+        GRPC_PORT                     = "${NOMAD_PORT_grpc}"
         METRICS_PORT                  = "${NOMAD_PORT_metrics}"
         INSTANCE_ID                   = "${NOMAD_ALLOC_ID}"
         CONSUL_HTTP_ADDR              = var.consul_http_addr
         APP_LOG_PATH                  = "/app/logs/worker/${NOMAD_ALLOC_ID}.log"
         PEER_REFRESH_INTERVAL_MS      = var.peer_refresh_interval_ms
         REPORT_INTERVAL_MS            = var.report_interval_ms
+        MINIO_ENDPOINT                = var.minio_endpoint
+        MINIO_ACCESS_KEY              = var.minio_access_key
+        MINIO_SECRET_KEY              = var.minio_secret_key
+        MINIO_BUCKET                  = var.minio_bucket
+        MINIO_USE_SSL                 = var.minio_use_ssl
       }
 
       resources {
@@ -137,6 +157,31 @@ variable "peer_refresh_interval_ms" {
 variable "report_interval_ms" {
   type    = string
   default = "4000"
+}
+
+variable "minio_endpoint" {
+  type    = string
+  default = ""
+}
+
+variable "minio_access_key" {
+  type    = string
+  default = ""
+}
+
+variable "minio_secret_key" {
+  type    = string
+  default = ""
+}
+
+variable "minio_bucket" {
+  type    = string
+  default = "login-snapshots"
+}
+
+variable "minio_use_ssl" {
+  type    = string
+  default = "false"
 }
 
 variable "host_volume" {

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,8 +23,12 @@ import (
 	"syscall"
 	"time"
 
+	"go-worker-demo/internal/sessionrpc"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
 )
 
 var (
@@ -58,21 +64,21 @@ var (
 		[]string{"service", "target_service"},
 	)
 
-	workExecuteTotal = prometheus.NewCounterVec(
+	sessionEventsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "go_worker_execute_total",
-			Help: "Total work execution attempts handled by workers.",
+			Name: "go_worker_session_events_total",
+			Help: "Total session events handled by workers.",
 		},
-		[]string{"task_type", "result"},
+		[]string{"action", "result"},
 	)
 
-	workExecuteDurationSeconds = prometheus.NewHistogramVec(
+	sessionEventDurationSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "go_worker_execute_duration_seconds",
-			Help:    "Duration of work execution handled by workers in seconds.",
-			Buckets: []float64{0.05, 0.1, 0.3, 0.5, 1, 2, 5},
+			Name:    "go_worker_session_event_duration_seconds",
+			Help:    "Duration of session event handling on the worker in seconds.",
+			Buckets: []float64{0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5},
 		},
-		[]string{"task_type", "result"},
+		[]string{"action", "result"},
 	)
 
 	reportsSentTotal = prometheus.NewCounterVec(
@@ -86,7 +92,7 @@ var (
 	queueDepthGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "go_worker_queue_depth",
-			Help: "Simulated queue depth on the worker.",
+			Help: "Current queue depth on the worker.",
 		},
 	)
 
@@ -100,8 +106,16 @@ var (
 	temperatureGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "go_worker_temperature_celsius",
-			Help: "Simulated worker temperature in celsius.",
+			Help: "Current worker temperature in celsius.",
 		},
+	)
+
+	minioUploadsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "go_worker_minio_upload_total",
+			Help: "Total MinIO upload attempts from worker.",
+		},
+		[]string{"bucket", "result"},
 	)
 )
 
@@ -109,29 +123,51 @@ type config struct {
 	serviceName                string
 	targetServiceName          string
 	targetDiscoveryServiceName string
+	staticGatewayAddrs         []string
 	instanceID                 string
 	appPort                    string
+	grpcPort                   string
 	metricsPort                string
 	consulHTTPAddr             string
 	logPath                    string
 	peerRefreshInterval        time.Duration
 	reportInterval             time.Duration
-	requestTimeout             time.Duration
+	grpcRequestTimeout         time.Duration
+	minioEndpoint              string
+	minioAccessKey             string
+	minioSecretKey             string
+	minioBucket                string
+	minioUseSSL                bool
 }
 
 type app struct {
-	config       config
-	startedAt    time.Time
-	logger       *log.Logger
-	httpClient   *http.Client
-	random       *rand.Rand
-	randMu       sync.Mutex
-	gatewaysMu   sync.RWMutex
-	gateways     []peer
+	sessionrpc.UnimplementedWorkerServiceServer
+
+	config     config
+	startedAt  time.Time
+	logger     *log.Logger
+	httpClient *http.Client
+	random     *rand.Rand
+	randMu     sync.Mutex
+
+	gatewaysMu sync.RWMutex
+	gateways   []peer
+
+	sessionsMu sync.RWMutex
+	sessions   map[string]sessionState
+
+	minioClient *minio.Client
+
+	requestCount atomic.Uint64
 	queueDepth   atomic.Int64
 	activeJobs   atomic.Int64
 	temperature  atomic.Uint64
-	requestCount atomic.Uint64
+}
+
+type sessionState struct {
+	SnapshotObjectKey string
+	LoginAt           time.Time
+	LastAction        string
 }
 
 type peer struct {
@@ -153,25 +189,6 @@ type consulServiceEntry struct {
 	} `json:"Service"`
 }
 
-type workRequest struct {
-	RequestID    string `json:"request_id"`
-	FromService  string `json:"from_service"`
-	FromInstance string `json:"from_instance"`
-	TaskType     string `json:"task_type"`
-	DelayMs      int    `json:"delay_ms"`
-	SentAt       string `json:"sent_at"`
-}
-
-type workerReport struct {
-	FromService        string  `json:"from_service"`
-	FromInstance       string  `json:"from_instance"`
-	QueueDepth         int     `json:"queue_depth"`
-	ActiveJobs         int     `json:"active_jobs"`
-	TemperatureCelsius float64 `json:"temperature_celsius"`
-	Message            string  `json:"message"`
-	SentAt             string  `json:"sent_at"`
-}
-
 type logEntry struct {
 	Level              string  `json:"level"`
 	Event              string  `json:"event"`
@@ -183,14 +200,27 @@ type logEntry struct {
 	Path               string  `json:"path,omitempty"`
 	Method             string  `json:"method,omitempty"`
 	Status             int     `json:"status,omitempty"`
-	TaskType           string  `json:"task_type,omitempty"`
+	Action             string  `json:"action,omitempty"`
+	EventID            string  `json:"event_id,omitempty"`
+	SessionID          string  `json:"session_id,omitempty"`
+	ClientID           string  `json:"client_id,omitempty"`
 	Detail             string  `json:"detail,omitempty"`
-	RequestID          string  `json:"request_id,omitempty"`
 	QueueDepth         int64   `json:"queue_depth,omitempty"`
 	ActiveJobs         int64   `json:"active_jobs,omitempty"`
 	TemperatureCelsius float64 `json:"temperature_celsius,omitempty"`
 	GatewayCount       int     `json:"gateway_count,omitempty"`
+	SnapshotObjectKey  string  `json:"snapshot_object_key,omitempty"`
 	Timestamp          string  `json:"ts"`
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
 }
 
 func main() {
@@ -199,12 +229,13 @@ func main() {
 		httpRequestDurationSeconds,
 		processUp,
 		discoveredGateways,
-		workExecuteTotal,
-		workExecuteDurationSeconds,
+		sessionEventsTotal,
+		sessionEventDurationSeconds,
 		reportsSentTotal,
 		queueDepthGauge,
 		activeJobsGauge,
 		temperatureGauge,
+		minioUploadsTotal,
 	)
 
 	cfg := loadConfig()
@@ -219,11 +250,27 @@ func main() {
 		startedAt: time.Now(),
 		logger:    logger,
 		httpClient: &http.Client{
-			Timeout: cfg.requestTimeout,
+			Timeout: 3 * time.Second,
 		},
-		random: rand.New(rand.NewSource(time.Now().UnixNano())),
+		random:   rand.New(rand.NewSource(time.Now().UnixNano())),
+		sessions: make(map[string]sessionState),
 	}
 
+	if cfg.minioEndpoint != "" {
+		client, clientErr := minio.New(cfg.minioEndpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(cfg.minioAccessKey, cfg.minioSecretKey, ""),
+			Secure: cfg.minioUseSSL,
+		})
+		if clientErr != nil {
+			log.Fatalf("init minio client failed: %v", clientErr)
+		}
+		application.minioClient = client
+		if err := application.ensureMinioBucket(context.Background()); err != nil {
+			log.Fatalf("ensure minio bucket failed: %v", err)
+		}
+	}
+
+	processUp.Set(1)
 	application.queueDepth.Store(0)
 	application.activeJobs.Store(0)
 	application.setTemperature(41.2)
@@ -231,19 +278,17 @@ func main() {
 	activeJobsGauge.Set(0)
 	temperatureGauge.Set(41.2)
 	discoveredGateways.WithLabelValues(cfg.serviceName, cfg.targetServiceName).Set(0)
-	processUp.Set(1)
 
 	appMux := http.NewServeMux()
 	appMux.HandleFunc("/", application.handleRoot)
 	appMux.HandleFunc("/healthz", application.handleHealth)
 	appMux.HandleFunc("/health", application.handleHealth)
 	appMux.HandleFunc("/gateways", application.handleGateways)
-	appMux.HandleFunc("/work/execute", application.handleExecuteWork)
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
 
-	appServer := &http.Server{
+	httpServer := &http.Server{
 		Addr:              ":" + cfg.appPort,
 		Handler:           application.withMetrics(appMux),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -255,20 +300,35 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	grpcListener, err := net.Listen("tcp", ":"+cfg.grpcPort)
+	if err != nil {
+		log.Fatalf("listen grpc failed: %v", err)
+	}
+
+	grpcServer := grpc.NewServer(sessionrpc.DefaultServerOptions()...)
+	sessionrpc.RegisterWorkerServiceServer(grpcServer, application)
+
 	go application.refreshGatewaysLoop()
 	go application.reportLoop()
 
 	go func() {
-		application.writeLog(logEntry{Level: "info", Event: "application_server_start"})
-		if err := appServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("application server failed: %v", err)
+		application.writeLog(logEntry{Level: "info", Event: "http_server_starting"})
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("http server failed: %v", err)
 		}
 	}()
 
 	go func() {
-		application.writeLog(logEntry{Level: "info", Event: "metrics_server_start"})
-		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		application.writeLog(logEntry{Level: "info", Event: "metrics_server_starting"})
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("metrics server failed: %v", err)
+		}
+	}()
+
+	go func() {
+		application.writeLog(logEntry{Level: "info", Event: "grpc_server_starting"})
+		if err := grpcServer.Serve(grpcListener); err != nil {
+			log.Fatalf("grpc server failed: %v", err)
 		}
 	}()
 
@@ -277,48 +337,197 @@ func main() {
 	<-sigCh
 
 	processUp.Set(0)
-	application.writeLog(logEntry{Level: "info", Event: "shutdown_signal"})
+	application.writeLog(logEntry{Level: "info", Event: "shutdown_signal_received"})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_ = appServer.Shutdown(ctx)
+	grpcServer.GracefulStop()
+	_ = httpServer.Shutdown(ctx)
 	_ = metricsServer.Shutdown(ctx)
 }
 
-func loadConfig() config {
-	serviceName := envOrDefault("SERVICE_NAME", "worker")
-	targetServiceName := envOrDefault("TARGET_SERVICE_NAME", "gateway")
-	targetDiscoveryServiceName := envOrDefault("TARGET_DISCOVERY_SERVICE_NAME", "gateway-http")
+func (a *app) ProcessSessionEvent(ctx context.Context, event *sessionrpc.SessionEvent) (*sessionrpc.SessionResult, error) {
+	startedAt := time.Now()
+	result := "success"
 
-	instanceID := envOrDefault("INSTANCE_ID", envOrDefault("NOMAD_ALLOC_ID", hostnameOrDefault("worker-demo")))
+	a.queueDepth.Add(1)
+	queueDepthGauge.Set(float64(a.queueDepth.Load()))
+	a.activeJobs.Add(1)
+	activeJobsGauge.Set(float64(a.activeJobs.Load()))
+	a.randomizeTemperature(0.2, 1.8)
 
-	return config{
-		serviceName:                serviceName,
-		targetServiceName:          targetServiceName,
-		targetDiscoveryServiceName: targetDiscoveryServiceName,
-		instanceID:                 instanceID,
-		appPort:                    envOrDefault("APP_PORT", "18081"),
-		metricsPort:                envOrDefault("METRICS_PORT", "12113"),
-		consulHTTPAddr:             ensureHTTPPrefix(envOrDefault("CONSUL_HTTP_ADDR", "127.0.0.1:8500")),
-		logPath:                    envOrDefault("APP_LOG_PATH", "/app/logs/go-worker-demo.log"),
-		peerRefreshInterval:        envDurationMillisOrDefault("PEER_REFRESH_INTERVAL_MS", 5000),
-		reportInterval:             envDurationMillisOrDefault("REPORT_INTERVAL_MS", 4000),
-		requestTimeout:             envDurationMillisOrDefault("HTTP_REQUEST_TIMEOUT_MS", 3000),
+	defer func() {
+		a.activeJobs.Add(-1)
+		if a.activeJobs.Load() < 0 {
+			a.activeJobs.Store(0)
+		}
+		activeJobsGauge.Set(float64(a.activeJobs.Load()))
+
+		if a.queueDepth.Load() > 0 {
+			a.queueDepth.Add(-1)
+		}
+		if a.queueDepth.Load() < 0 {
+			a.queueDepth.Store(0)
+		}
+		queueDepthGauge.Set(float64(a.queueDepth.Load()))
+		a.randomizeTemperature(-0.3, 0.9)
+		sessionEventsTotal.WithLabelValues(event.Action, result).Inc()
+		sessionEventDurationSeconds.WithLabelValues(event.Action, result).Observe(time.Since(startedAt).Seconds())
+	}()
+
+	if !isValidAction(event.Action) {
+		result = "error"
+		return &sessionrpc.SessionResult{
+			EventID:            event.EventID,
+			SessionID:          event.SessionID,
+			Action:             event.Action,
+			Result:             "error",
+			Message:            "invalid action",
+			GatewayID:          event.GatewayID,
+			WorkerID:           a.config.instanceID,
+			QueueDepth:         a.queueDepth.Load(),
+			ActiveJobs:         a.activeJobs.Load(),
+			TemperatureCelsius: a.temperatureValue(),
+			ProcessedAt:        time.Now().Format(time.RFC3339),
+		}, nil
+	}
+
+	a.writeLog(logEntry{
+		Level:      "info",
+		Event:      "session_event_received",
+		Action:     event.Action,
+		EventID:    event.EventID,
+		SessionID:  event.SessionID,
+		ClientID:   event.ClientID,
+		QueueDepth: a.queueDepth.Load(),
+		ActiveJobs: a.activeJobs.Load(),
+	})
+
+	time.Sleep(a.processingDelay(event.Action))
+
+	snapshotKey := a.handleSessionState(ctx, event)
+
+	a.writeLog(logEntry{
+		Level:              "info",
+		Event:              "session_event_processed",
+		Action:             event.Action,
+		EventID:            event.EventID,
+		SessionID:          event.SessionID,
+		ClientID:           event.ClientID,
+		QueueDepth:         a.queueDepth.Load(),
+		ActiveJobs:         a.activeJobs.Load(),
+		TemperatureCelsius: a.temperatureValue(),
+		SnapshotObjectKey:  snapshotKey,
+	})
+
+	return &sessionrpc.SessionResult{
+		EventID:            event.EventID,
+		SessionID:          event.SessionID,
+		Action:             event.Action,
+		Result:             "success",
+		Message:            "worker handled session event",
+		GatewayID:          event.GatewayID,
+		WorkerID:           a.config.instanceID,
+		SnapshotObjectKey:  snapshotKey,
+		QueueDepth:         a.queueDepth.Load(),
+		ActiveJobs:         a.activeJobs.Load(),
+		TemperatureCelsius: a.temperatureValue(),
+		ProcessedAt:        time.Now().Format(time.RFC3339),
+	}, nil
+}
+
+func (a *app) handleSessionState(ctx context.Context, event *sessionrpc.SessionEvent) string {
+	a.sessionsMu.Lock()
+	defer a.sessionsMu.Unlock()
+
+	state := a.sessions[event.SessionID]
+
+	switch event.Action {
+	case sessionrpc.ActionLogin:
+		snapshotKey := a.buildSnapshotObjectKey(event.SessionID)
+		if a.minioClient != nil {
+			if err := a.uploadLoginSnapshot(ctx, snapshotKey, event); err != nil {
+				a.writeLog(logEntry{
+					Level:     "error",
+					Event:     "minio_upload_failed",
+					Action:    event.Action,
+					EventID:   event.EventID,
+					SessionID: event.SessionID,
+					ClientID:  event.ClientID,
+					Detail:    err.Error(),
+				})
+			}
+		}
+		state = sessionState{
+			SnapshotObjectKey: snapshotKey,
+			LoginAt:           time.Now(),
+			LastAction:        event.Action,
+		}
+		a.sessions[event.SessionID] = state
+		return snapshotKey
+	case sessionrpc.ActionHeartbeat:
+		state.LastAction = event.Action
+		if state.LoginAt.IsZero() {
+			state.LoginAt = time.Now()
+		}
+		a.sessions[event.SessionID] = state
+		return state.SnapshotObjectKey
+	case sessionrpc.ActionLogout:
+		delete(a.sessions, event.SessionID)
+		state.LastAction = event.Action
+		return state.SnapshotObjectKey
+	default:
+		return state.SnapshotObjectKey
 	}
 }
 
-func newLogger(logPath string) (*log.Logger, *os.File, error) {
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return nil, nil, err
+func (a *app) uploadLoginSnapshot(ctx context.Context, objectKey string, event *sessionrpc.SessionEvent) error {
+	if a.minioClient == nil {
+		return nil
 	}
 
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	payload := map[string]any{
+		"event_id":     event.EventID,
+		"session_id":   event.SessionID,
+		"client_id":    event.ClientID,
+		"user_id":      event.UserID,
+		"device_id":    event.DeviceID,
+		"action":       event.Action,
+		"payload":      event.Payload,
+		"gateway_id":   event.GatewayID,
+		"worker_id":    a.config.instanceID,
+		"generated_at": time.Now().Format(time.RFC3339),
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, nil, err
+		minioUploadsTotal.WithLabelValues(a.config.minioBucket, "marshal_error").Inc()
+		return err
 	}
 
-	return log.New(io.MultiWriter(os.Stdout, file), "", 0), file, nil
+	reader := bytes.NewReader(body)
+	_, err = a.minioClient.PutObject(ctx, a.config.minioBucket, objectKey, reader, int64(len(body)), minio.PutObjectOptions{
+		ContentType: "application/json",
+	})
+	if err != nil {
+		minioUploadsTotal.WithLabelValues(a.config.minioBucket, "error").Inc()
+		return err
+	}
+
+	minioUploadsTotal.WithLabelValues(a.config.minioBucket, "success").Inc()
+	return nil
+}
+
+func (a *app) ensureMinioBucket(ctx context.Context) error {
+	exists, err := a.minioClient.BucketExists(ctx, a.config.minioBucket)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return a.minioClient.MakeBucket(ctx, a.config.minioBucket, minio.MakeBucketOptions{})
 }
 
 func (a *app) handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -327,12 +536,17 @@ func (a *app) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"targetService":          a.config.targetServiceName,
 		"targetDiscoveryService": a.config.targetDiscoveryServiceName,
 		"instanceId":             a.config.instanceID,
+		"appPort":                a.config.appPort,
+		"grpcPort":               a.config.grpcPort,
+		"metricsPort":            a.config.metricsPort,
 		"gatewayCount":           len(a.snapshotGateways()),
 		"queueDepth":             a.queueDepth.Load(),
 		"activeJobs":             a.activeJobs.Load(),
 		"temperatureCelsius":     a.temperatureValue(),
-		"time":                   time.Now().Format(time.RFC3339),
+		"trackedSessions":        a.sessionCount(),
+		"requestCount":           a.requestCount.Add(1),
 		"uptimeSec":              int64(time.Since(a.startedAt).Seconds()),
+		"time":                   time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -347,8 +561,8 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"queueDepth":             a.queueDepth.Load(),
 		"activeJobs":             a.activeJobs.Load(),
 		"temperatureCelsius":     a.temperatureValue(),
+		"trackedSessions":        a.sessionCount(),
 		"time":                   time.Now().Format(time.RFC3339),
-		"uptimeSec":              int64(time.Since(a.startedAt).Seconds()),
 	})
 }
 
@@ -363,90 +577,15 @@ func (a *app) handleGateways(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *app) handleExecuteWork(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "method not allowed"})
-		return
-	}
-
-	var payload workRequest
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"message": "invalid payload"})
-		return
-	}
-
-	a.queueDepth.Add(1)
-	queueDepthGauge.Set(float64(a.queueDepth.Load()))
-	a.activeJobs.Add(1)
-	activeJobsGauge.Set(float64(a.activeJobs.Load()))
-	a.randomizeTemperature(0.2, 1.5)
-
-	startedAt := time.Now()
-	a.writeLog(logEntry{
-		Level:      "info",
-		Event:      "work_received",
-		TaskType:   payload.TaskType,
-		RequestID:  payload.RequestID,
-		Detail:     fmt.Sprintf("delay_ms=%d from=%s", payload.DelayMs, payload.FromService),
-		QueueDepth: a.queueDepth.Load(),
-		ActiveJobs: a.activeJobs.Load(),
-	})
-
-	time.Sleep(time.Duration(payload.DelayMs) * time.Millisecond)
-
-	a.activeJobs.Add(-1)
-	if a.activeJobs.Load() < 0 {
-		a.activeJobs.Store(0)
-	}
-	activeJobsGauge.Set(float64(a.activeJobs.Load()))
-
-	if a.queueDepth.Load() > 0 {
-		a.queueDepth.Add(-1)
-	}
-	if a.queueDepth.Load() < 0 {
-		a.queueDepth.Store(0)
-	}
-	queueDepthGauge.Set(float64(a.queueDepth.Load()))
-	a.randomizeTemperature(-0.4, 0.8)
-
-	workExecuteTotal.WithLabelValues(payload.TaskType, "success").Inc()
-	workExecuteDurationSeconds.WithLabelValues(payload.TaskType, "success").Observe(time.Since(startedAt).Seconds())
-
-	a.writeLog(logEntry{
-		Level:              "info",
-		Event:              "work_finished",
-		TaskType:           payload.TaskType,
-		RequestID:          payload.RequestID,
-		Status:             http.StatusOK,
-		QueueDepth:         a.queueDepth.Load(),
-		ActiveJobs:         a.activeJobs.Load(),
-		TemperatureCelsius: a.temperatureValue(),
-	})
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"message":            "work finished",
-		"service":            a.config.serviceName,
-		"instanceId":         a.config.instanceID,
-		"taskType":           payload.TaskType,
-		"requestId":          payload.RequestID,
-		"queueDepth":         a.queueDepth.Load(),
-		"activeJobs":         a.activeJobs.Load(),
-		"temperatureCelsius": a.temperatureValue(),
-		"time":               time.Now().Format(time.RFC3339),
-	})
-}
-
 func (a *app) withMetrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedAt := time.Now()
 		recorder := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-
 		next.ServeHTTP(recorder, r)
 
 		codeLabel := strconv.Itoa(recorder.statusCode)
 		httpRequestsTotal.WithLabelValues(r.URL.Path, r.Method, codeLabel).Inc()
 		httpRequestDurationSeconds.WithLabelValues(r.URL.Path, r.Method, codeLabel).Observe(time.Since(startedAt).Seconds())
-		a.requestCount.Add(1)
 		a.writeLog(logEntry{
 			Level:              "info",
 			Event:              "http_request_processed",
@@ -471,15 +610,24 @@ func (a *app) refreshGatewaysLoop() {
 }
 
 func (a *app) refreshGateways() {
-	gateways, err := a.fetchPeersFromConsul()
-	if err != nil {
-		a.writeLog(logEntry{
-			Level:         "error",
-			Event:         "gateway_refresh_failed",
-			TargetService: a.config.targetServiceName,
-			Detail:        err.Error(),
-		})
-		return
+	var (
+		gateways []peer
+		err      error
+	)
+
+	if len(a.config.staticGatewayAddrs) > 0 {
+		gateways = buildStaticPeers(a.config.targetServiceName, a.config.staticGatewayAddrs)
+	} else {
+		gateways, err = a.fetchPeersFromConsul()
+		if err != nil {
+			a.writeLog(logEntry{
+				Level:         "error",
+				Event:         "gateway_refresh_failed",
+				TargetService: a.config.targetServiceName,
+				Detail:        err.Error(),
+			})
+			return
+		}
 	}
 
 	a.gatewaysMu.Lock()
@@ -521,29 +669,28 @@ func (a *app) reportLoop() {
 }
 
 func (a *app) sendReport(gateway peer) error {
-	payload := workerReport{
-		FromService:        a.config.serviceName,
-		FromInstance:       a.config.instanceID,
-		QueueDepth:         int(a.queueDepth.Load()),
-		ActiveJobs:         int(a.activeJobs.Load()),
+	target := fmt.Sprintf("%s:%d", gateway.Address, gateway.Port)
+	conn, err := sessionrpc.DialContext(context.Background(), target)
+	if err != nil {
+		reportsSentTotal.WithLabelValues(a.config.targetServiceName, "error").Inc()
+		return err
+	}
+	defer conn.Close()
+
+	client := sessionrpc.NewGatewayServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), a.config.grpcRequestTimeout)
+	defer cancel()
+
+	_, err = client.ReportWorkerStatus(ctx, &sessionrpc.WorkerStatusReport{
+		WorkerID:           a.config.instanceID,
+		GatewayID:          gateway.ID,
+		QueueDepth:         a.queueDepth.Load(),
+		ActiveJobs:         a.activeJobs.Load(),
 		TemperatureCelsius: a.temperatureValue(),
-		Message:            "worker status report",
+		OnlineSessions:     int64(a.sessionCount()),
+		Message:            "worker grpc status report",
 		SentAt:             time.Now().Format(time.RFC3339),
-	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	url := fmt.Sprintf("http://%s:%d/worker/report", gateway.Address, gateway.Port)
-	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	response, err := a.httpClient.Do(request)
+	})
 	if err != nil {
 		reportsSentTotal.WithLabelValues(a.config.targetServiceName, "error").Inc()
 		a.writeLog(logEntry{
@@ -556,29 +703,18 @@ func (a *app) sendReport(gateway peer) error {
 		})
 		return err
 	}
-	defer response.Body.Close()
 
-	result := "success"
-	if response.StatusCode >= http.StatusBadRequest {
-		result = "error"
-	}
-
-	reportsSentTotal.WithLabelValues(a.config.targetServiceName, result).Inc()
+	reportsSentTotal.WithLabelValues(a.config.targetServiceName, "success").Inc()
 	a.writeLog(logEntry{
-		Level:              levelForResult(result),
+		Level:              "info",
 		Event:              "report_sent",
 		TargetService:      a.config.targetServiceName,
 		PeerID:             gateway.ID,
 		PeerAddress:        peerAddress(gateway),
-		Status:             response.StatusCode,
 		QueueDepth:         a.queueDepth.Load(),
 		ActiveJobs:         a.activeJobs.Load(),
 		TemperatureCelsius: a.temperatureValue(),
 	})
-
-	if result == "error" {
-		return fmt.Errorf("gateway returned status %d", response.StatusCode)
-	}
 	return nil
 }
 
@@ -599,16 +735,16 @@ func (a *app) fetchPeersFromConsul() ([]peer, error) {
 		return nil, err
 	}
 
-	gateways := make([]peer, 0, len(entries))
+	peers := make([]peer, 0, len(entries))
 	for _, entry := range entries {
-		address := entry.Service.Address
+		address := strings.TrimSpace(entry.Service.Address)
 		if address == "" {
-			address = entry.Node.Address
+			address = strings.TrimSpace(entry.Node.Address)
 		}
 		if address == "" || entry.Service.Port == 0 {
 			continue
 		}
-		gateways = append(gateways, peer{
+		peers = append(peers, peer{
 			ID:      entry.Service.ID,
 			Service: entry.Service.Service,
 			Address: address,
@@ -616,23 +752,10 @@ func (a *app) fetchPeersFromConsul() ([]peer, error) {
 		})
 	}
 
-	slices.SortFunc(gateways, func(a peer, b peer) int {
-		if a.Address == b.Address {
-			return strings.Compare(a.ID, b.ID)
-		}
-		return strings.Compare(a.Address, b.Address)
+	slices.SortFunc(peers, func(a, b peer) int {
+		return strings.Compare(peerAddress(a), peerAddress(b))
 	})
-
-	return gateways, nil
-}
-
-func (a *app) snapshotGateways() []peer {
-	a.gatewaysMu.RLock()
-	defer a.gatewaysMu.RUnlock()
-
-	gateways := make([]peer, len(a.gateways))
-	copy(gateways, a.gateways)
-	return gateways
+	return peers, nil
 }
 
 func (a *app) pickRandomGateway() (peer, bool) {
@@ -640,86 +763,215 @@ func (a *app) pickRandomGateway() (peer, bool) {
 	if len(gateways) == 0 {
 		return peer{}, false
 	}
+	if len(gateways) == 1 {
+		return gateways[0], true
+	}
+	return gateways[a.randomInt(len(gateways))], true
+}
 
+func buildStaticPeers(serviceName string, addresses []string) []peer {
+	peers := make([]peer, 0, len(addresses))
+	for idx, raw := range addresses {
+		address, port, ok := parseStaticAddress(raw)
+		if !ok {
+			continue
+		}
+		peers = append(peers, peer{
+			ID:      fmt.Sprintf("static-%s-%02d", serviceName, idx+1),
+			Service: serviceName,
+			Address: address,
+			Port:    port,
+		})
+	}
+	return peers
+}
+
+func parseStaticAddress(raw string) (string, int, bool) {
+	host, portText, ok := strings.Cut(strings.TrimSpace(raw), ":")
+	if !ok || strings.TrimSpace(host) == "" || strings.TrimSpace(portText) == "" {
+		return "", 0, false
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portText))
+	if err != nil || port <= 0 {
+		return "", 0, false
+	}
+	return strings.TrimSpace(host), port, true
+}
+
+func (a *app) snapshotGateways() []peer {
+	a.gatewaysMu.RLock()
+	defer a.gatewaysMu.RUnlock()
+	result := make([]peer, len(a.gateways))
+	copy(result, a.gateways)
+	return result
+}
+
+func (a *app) randomInt(max int) int {
 	a.randMu.Lock()
 	defer a.randMu.Unlock()
-	return gateways[a.random.Intn(len(gateways))], true
+	return a.random.Intn(max)
+}
+
+func (a *app) setTemperature(value float64) {
+	a.temperature.Store(math.Float64bits(value))
+}
+
+func (a *app) temperatureValue() float64 {
+	return math.Float64frombits(a.temperature.Load())
 }
 
 func (a *app) randomizeTemperature(minDelta, maxDelta float64) {
 	a.randMu.Lock()
+	defer a.randMu.Unlock()
+
+	current := a.temperatureValue()
 	delta := minDelta + a.random.Float64()*(maxDelta-minDelta)
-	a.randMu.Unlock()
-
-	value := a.temperatureValue() + delta
-	if value < 35 {
-		value = 35
+	next := current + delta
+	if next < 36 {
+		next = 36
 	}
-	if value > 82 {
-		value = 82
+	if next > 78 {
+		next = 78
 	}
-
-	a.setTemperature(value)
-	temperatureGauge.Set(value)
+	next = math.Round(next*10) / 10
+	a.setTemperature(next)
+	temperatureGauge.Set(next)
 }
 
-func (a *app) temperatureValue() float64 {
-	return mathFromBits(a.temperature.Load())
+func (a *app) processingDelay(action string) time.Duration {
+	base := 50
+	switch action {
+	case sessionrpc.ActionLogin:
+		base = 160
+	case sessionrpc.ActionHeartbeat:
+		base = 60
+	case sessionrpc.ActionLogout:
+		base = 110
+	}
+	return time.Duration(base+a.randomInt(120)) * time.Millisecond
 }
 
-func (a *app) setTemperature(value float64) {
-	a.temperature.Store(bitsFromMath(value))
+func (a *app) sessionCount() int {
+	a.sessionsMu.RLock()
+	defer a.sessionsMu.RUnlock()
+	return len(a.sessions)
+}
+
+func (a *app) buildSnapshotObjectKey(sessionID string) string {
+	now := time.Now()
+	return fmt.Sprintf("login-snapshots/%04d/%02d/%02d/%s.json", now.Year(), now.Month(), now.Day(), sessionID)
+}
+
+func loadConfig() config {
+	serviceName := envOrDefault("SERVICE_NAME", "worker")
+	targetServiceName := envOrDefault("TARGET_SERVICE_NAME", "gateway")
+	targetDiscoveryServiceName := envOrDefault("TARGET_DISCOVERY_SERVICE_NAME", "gateway-grpc")
+	instanceID := envOrDefault("INSTANCE_ID", envOrDefault("NOMAD_ALLOC_ID", hostnameOrDefault()))
+
+	return config{
+		serviceName:                serviceName,
+		targetServiceName:          targetServiceName,
+		targetDiscoveryServiceName: targetDiscoveryServiceName,
+		staticGatewayAddrs:         envCSV("STATIC_GATEWAY_ADDRS"),
+		instanceID:                 instanceID,
+		appPort:                    envOrDefault("APP_PORT", "18081"),
+		grpcPort:                   envOrDefault("GRPC_PORT", "19081"),
+		metricsPort:                envOrDefault("METRICS_PORT", "12113"),
+		consulHTTPAddr:             ensureHTTPPrefix(envOrDefault("CONSUL_HTTP_ADDR", "127.0.0.1:8500")),
+		logPath:                    envOrDefault("APP_LOG_PATH", "/app/logs/go-worker-demo.log"),
+		peerRefreshInterval:        envDurationMillisOrDefault("PEER_REFRESH_INTERVAL_MS", 5000),
+		reportInterval:             envDurationMillisOrDefault("REPORT_INTERVAL_MS", 4000),
+		grpcRequestTimeout:         envDurationMillisOrDefault("GRPC_REQUEST_TIMEOUT_MS", 3000),
+		minioEndpoint:              envOrDefault("MINIO_ENDPOINT", ""),
+		minioAccessKey:             envOrDefault("MINIO_ACCESS_KEY", ""),
+		minioSecretKey:             envOrDefault("MINIO_SECRET_KEY", ""),
+		minioBucket:                envOrDefault("MINIO_BUCKET", "login-snapshots"),
+		minioUseSSL:                envBoolOrDefault("MINIO_USE_SSL", false),
+	}
+}
+
+func newLogger(logPath string) (*log.Logger, *os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return nil, nil, err
+	}
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, nil, err
+	}
+	return log.New(io.MultiWriter(os.Stdout, file), "", 0), file, nil
 }
 
 func (a *app) writeLog(entry logEntry) {
 	entry.Service = a.config.serviceName
 	entry.InstanceID = a.config.instanceID
-	if entry.GatewayCount == 0 {
-		entry.GatewayCount = len(a.snapshotGateways())
-	}
-	if entry.QueueDepth == 0 {
-		entry.QueueDepth = a.queueDepth.Load()
-	}
-	if entry.ActiveJobs == 0 {
-		entry.ActiveJobs = a.activeJobs.Load()
-	}
-	if entry.TemperatureCelsius == 0 {
-		entry.TemperatureCelsius = a.temperatureValue()
-	}
 	entry.Timestamp = time.Now().Format(time.RFC3339)
-
-	data, err := json.Marshal(entry)
+	body, err := json.Marshal(entry)
 	if err != nil {
+		a.logger.Printf(`{"level":"error","event":"log_marshal_failed","service":"%s","instance_id":"%s","detail":%q,"ts":"%s"}`,
+			a.config.serviceName,
+			a.config.instanceID,
+			err.Error(),
+			time.Now().Format(time.RFC3339),
+		)
 		return
 	}
-
-	a.logger.Println(string(data))
+	a.logger.Println(string(body))
 }
 
-func writeJSON(w http.ResponseWriter, code int, data any) {
+func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(data)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func envOrDefault(key, fallback string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
 	}
-	return value
+	return fallback
 }
 
-func envDurationMillisOrDefault(key string, fallbackMillis int) time.Duration {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return time.Duration(fallbackMillis) * time.Millisecond
+func envDurationMillisOrDefault(key string, fallback int) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return time.Duration(fallback) * time.Millisecond
 	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		return time.Duration(fallbackMillis) * time.Millisecond
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return time.Duration(fallback) * time.Millisecond
 	}
-	return time.Duration(parsed) * time.Millisecond
+	return time.Duration(value) * time.Millisecond
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func envCSV(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 func ensureHTTPPrefix(value string) string {
@@ -729,42 +981,23 @@ func ensureHTTPPrefix(value string) string {
 	return "http://" + value
 }
 
-func hostnameOrDefault(fallback string) string {
-	hostname, err := os.Hostname()
-	if err != nil || strings.TrimSpace(hostname) == "" {
-		return fallback
+func hostnameOrDefault() string {
+	name, err := os.Hostname()
+	if err != nil || strings.TrimSpace(name) == "" {
+		return "unknown-host"
 	}
-	return hostname
+	return name
 }
 
-func peerAddress(value peer) string {
-	if value.Address == "" || value.Port == 0 {
-		return ""
+func peerAddress(item peer) string {
+	return fmt.Sprintf("%s:%d", item.Address, item.Port)
+}
+
+func isValidAction(action string) bool {
+	switch action {
+	case sessionrpc.ActionLogin, sessionrpc.ActionHeartbeat, sessionrpc.ActionLogout:
+		return true
+	default:
+		return false
 	}
-	return fmt.Sprintf("%s:%d", value.Address, value.Port)
-}
-
-func levelForResult(result string) string {
-	if result == "error" {
-		return "error"
-	}
-	return "info"
-}
-
-func bitsFromMath(value float64) uint64 {
-	return math.Float64bits(value)
-}
-
-func mathFromBits(value uint64) float64 {
-	return math.Float64frombits(value)
-}
-
-type statusRecorder struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (r *statusRecorder) WriteHeader(code int) {
-	r.statusCode = code
-	r.ResponseWriter.WriteHeader(code)
 }

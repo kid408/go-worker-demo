@@ -1,53 +1,52 @@
 # go-worker-demo
 
-`go-worker-demo` 是“处理层”示例服务。
+`go-worker-demo` 现在是 gRPC 处理层。
 
-Nomad 部署时不要再用 `latest` 标签。当前示例统一使用 `go-worker-demo:dev`，否则 Docker driver 很容易继续尝试远程拉取。
+职责：
 
-它的职责是：
+1. 发现 `gateway-grpc`
+2. 对外提供 `WorkerService/ProcessSessionEvent`
+3. 处理 `login / heartbeat / logout`
+4. 登录时将会话快照写入 MinIO
+5. 周期性向 gateway 发送 gRPC 状态上报
 
-1. 在 Consul 中发现 `gateway-http`
-2. 接收 gateway 派发的任务
-3. 模拟任务执行耗时、队列、活跃任务、温度
-4. 主动向 gateway 上报状态
+它保留了 HTTP 端口，只做：
 
-## 主要接口
+- `/healthz`
+- `/gateways`
 
-- `GET /`
-- `GET /healthz`
-- `GET /health`
-- `GET /gateways`
-- `POST /work/execute`
-- `GET /metrics`
+真正的业务通信已经改成 gRPC。
 
-## 关键指标
+## 默认端口
 
-- `go_worker_process_up`
-- `go_worker_discovered_gateways`
-- `go_worker_execute_total`
-- `go_worker_execute_duration_seconds`
-- `go_worker_reports_sent_total`
-- `go_worker_queue_depth`
-- `go_worker_active_jobs`
-- `go_worker_temperature_celsius`
+- HTTP：`18081`
+- gRPC：`19081`
+- Metrics：`12113`
 
-## 本地直跑
+## 关键环境变量
 
-```bash
+- `CONSUL_HTTP_ADDR`
+- `TARGET_DISCOVERY_SERVICE_NAME=gateway-grpc`
+- `APP_PORT`
+- `GRPC_PORT`
+- `METRICS_PORT`
+- `MINIO_ENDPOINT`
+- `MINIO_ACCESS_KEY`
+- `MINIO_SECRET_KEY`
+- `MINIO_BUCKET`
+
+## 本地运行
+
+```powershell
 go mod tidy
-mkdir -p ./runtime-logs
-SERVICE_NAME=worker \
-TARGET_SERVICE_NAME=gateway \
-TARGET_DISCOVERY_SERVICE_NAME=gateway-http \
-CONSUL_HTTP_ADDR=http://127.0.0.1:8500 \
-APP_PORT=18081 \
-METRICS_PORT=12113 \
-APP_LOG_PATH=./runtime-logs/go-worker-demo.log \
+$env:CONSUL_HTTP_ADDR="http://127.0.0.1:8500"
+$env:TARGET_DISCOVERY_SERVICE_NAME="gateway-grpc"
+$env:APP_PORT="18081"
+$env:GRPC_PORT="19081"
+$env:METRICS_PORT="12113"
+$env:MINIO_ENDPOINT="127.0.0.1:9000"
+$env:MINIO_ACCESS_KEY="minioadmin"
+$env:MINIO_SECRET_KEY="minioadmin123"
+$env:MINIO_BUCKET="login-snapshots"
 go run .
-```
-
-## Loki 查询
-
-```text
-{job="go-worker-demo"}
 ```
