@@ -379,13 +379,13 @@ func (a *app) ProcessSessionEvent(ctx context.Context, event *sessionrpc.Session
 	if !isValidAction(event.Action) {
 		result = "error"
 		return &sessionrpc.SessionResult{
-			EventID:            event.EventID,
-			SessionID:          event.SessionID,
+			EventId:            event.EventId,
+			SessionId:          event.SessionId,
 			Action:             event.Action,
 			Result:             "error",
 			Message:            "invalid action",
-			GatewayID:          event.GatewayID,
-			WorkerID:           a.config.instanceID,
+			GatewayId:          event.GatewayId,
+			WorkerId:           a.config.instanceID,
 			QueueDepth:         a.queueDepth.Load(),
 			ActiveJobs:         a.activeJobs.Load(),
 			TemperatureCelsius: a.temperatureValue(),
@@ -397,9 +397,9 @@ func (a *app) ProcessSessionEvent(ctx context.Context, event *sessionrpc.Session
 		Level:      "info",
 		Event:      "session_event_received",
 		Action:     event.Action,
-		EventID:    event.EventID,
-		SessionID:  event.SessionID,
-		ClientID:   event.ClientID,
+		EventID:    event.EventId,
+		SessionID:  event.SessionId,
+		ClientID:   event.ClientId,
 		QueueDepth: a.queueDepth.Load(),
 		ActiveJobs: a.activeJobs.Load(),
 	})
@@ -412,9 +412,9 @@ func (a *app) ProcessSessionEvent(ctx context.Context, event *sessionrpc.Session
 		Level:              "info",
 		Event:              "session_event_processed",
 		Action:             event.Action,
-		EventID:            event.EventID,
-		SessionID:          event.SessionID,
-		ClientID:           event.ClientID,
+		EventID:            event.EventId,
+		SessionID:          event.SessionId,
+		ClientID:           event.ClientId,
 		QueueDepth:         a.queueDepth.Load(),
 		ActiveJobs:         a.activeJobs.Load(),
 		TemperatureCelsius: a.temperatureValue(),
@@ -422,13 +422,13 @@ func (a *app) ProcessSessionEvent(ctx context.Context, event *sessionrpc.Session
 	})
 
 	return &sessionrpc.SessionResult{
-		EventID:            event.EventID,
-		SessionID:          event.SessionID,
+		EventId:            event.EventId,
+		SessionId:          event.SessionId,
 		Action:             event.Action,
 		Result:             "success",
 		Message:            "worker handled session event",
-		GatewayID:          event.GatewayID,
-		WorkerID:           a.config.instanceID,
+		GatewayId:          event.GatewayId,
+		WorkerId:           a.config.instanceID,
 		SnapshotObjectKey:  snapshotKey,
 		QueueDepth:         a.queueDepth.Load(),
 		ActiveJobs:         a.activeJobs.Load(),
@@ -441,20 +441,20 @@ func (a *app) handleSessionState(ctx context.Context, event *sessionrpc.SessionE
 	a.sessionsMu.Lock()
 	defer a.sessionsMu.Unlock()
 
-	state := a.sessions[event.SessionID]
+	state := a.sessions[event.SessionId]
 
 	switch event.Action {
 	case sessionrpc.ActionLogin:
-		snapshotKey := a.buildSnapshotObjectKey(event.SessionID)
+		snapshotKey := a.buildSnapshotObjectKey(event.SessionId)
 		if a.minioClient != nil {
 			if err := a.uploadLoginSnapshot(ctx, snapshotKey, event); err != nil {
 				a.writeLog(logEntry{
 					Level:     "error",
 					Event:     "minio_upload_failed",
 					Action:    event.Action,
-					EventID:   event.EventID,
-					SessionID: event.SessionID,
-					ClientID:  event.ClientID,
+					EventID:   event.EventId,
+					SessionID: event.SessionId,
+					ClientID:  event.ClientId,
 					Detail:    err.Error(),
 				})
 			}
@@ -464,17 +464,17 @@ func (a *app) handleSessionState(ctx context.Context, event *sessionrpc.SessionE
 			LoginAt:           time.Now(),
 			LastAction:        event.Action,
 		}
-		a.sessions[event.SessionID] = state
+		a.sessions[event.SessionId] = state
 		return snapshotKey
 	case sessionrpc.ActionHeartbeat:
 		state.LastAction = event.Action
 		if state.LoginAt.IsZero() {
 			state.LoginAt = time.Now()
 		}
-		a.sessions[event.SessionID] = state
+		a.sessions[event.SessionId] = state
 		return state.SnapshotObjectKey
 	case sessionrpc.ActionLogout:
-		delete(a.sessions, event.SessionID)
+		delete(a.sessions, event.SessionId)
 		state.LastAction = event.Action
 		return state.SnapshotObjectKey
 	default:
@@ -488,14 +488,14 @@ func (a *app) uploadLoginSnapshot(ctx context.Context, objectKey string, event *
 	}
 
 	payload := map[string]any{
-		"event_id":     event.EventID,
-		"session_id":   event.SessionID,
-		"client_id":    event.ClientID,
-		"user_id":      event.UserID,
-		"device_id":    event.DeviceID,
+		"event_id":     event.EventId,
+		"session_id":   event.SessionId,
+		"client_id":    event.ClientId,
+		"user_id":      event.UserId,
+		"device_id":    event.DeviceId,
 		"action":       event.Action,
 		"payload":      event.Payload,
-		"gateway_id":   event.GatewayID,
+		"gateway_id":   event.GatewayId,
 		"worker_id":    a.config.instanceID,
 		"generated_at": time.Now().Format(time.RFC3339),
 	}
@@ -682,8 +682,8 @@ func (a *app) sendReport(gateway peer) error {
 	defer cancel()
 
 	_, err = client.ReportWorkerStatus(ctx, &sessionrpc.WorkerStatusReport{
-		WorkerID:           a.config.instanceID,
-		GatewayID:          gateway.ID,
+		WorkerId:           a.config.instanceID,
+		GatewayId:          gateway.ID,
 		QueueDepth:         a.queueDepth.Load(),
 		ActiveJobs:         a.activeJobs.Load(),
 		TemperatureCelsius: a.temperatureValue(),
