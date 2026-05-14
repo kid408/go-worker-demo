@@ -8,4 +8,9 @@ consul_service_tags      = ["prometheus.enabled=true"]
 discovery_service_tags   = []
 peer_refresh_interval_ms = "5000"
 report_interval_ms       = "4000"
+minio_endpoint           = "127.0.0.1:9000"
+minio_access_key         = "minioadmin"
+minio_secret_key         = "minioadmin123"
+minio_bucket             = "login-snapshots"
+minio_use_ssl            = "false"
 host_volume              = "logs"
