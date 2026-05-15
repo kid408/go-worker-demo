@@ -86,49 +86,36 @@ pipeline {
       }
     }
 
-    stage('Smoke Test') {
-      steps {
-        sh '''
-          set -eu
-          export NOMAD_ADDR="${NOMAD_ADDR}"
-
-          diagnose() {
-            echo '=== nomad node status ==='
-            nomad node status || true
-            echo '=== nomad job status ==='
-            nomad job status -verbose worker || true
-            echo '=== nomad job allocations ==='
-            nomad job allocs worker || true
-            echo '=== consul worker-http ==='
-            curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-http?passing=true" | jq . || true
-            echo '=== consul worker-prom ==='
-            curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-prom?passing=true" | jq . || true
-          }
-
-          trap 'diagnose' 0
-
-          printf '[]\n' > /tmp/worker-http.json
-          printf '[]\n' > /tmp/worker-prom.json
-
-          for _ in $(seq 1 30); do
-            curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-http?passing=true" > /tmp/worker-http.json || printf '[]\n' > /tmp/worker-http.json
-            curl -fsS "${CONSUL_ADDR}/v1/health/service/worker-prom?passing=true" > /tmp/worker-prom.json || printf '[]\n' > /tmp/worker-prom.json
-
-            if jq -e 'length > 0' /tmp/worker-http.json >/dev/null 2>&1 &&
-               jq -e 'length > 0' /tmp/worker-prom.json >/dev/null 2>&1; then
-              nomad job status -verbose worker
-              jq . /tmp/worker-http.json
-              jq . /tmp/worker-prom.json
-              trap - 0
-              exit 0
-            fi
-
-            sleep 2
-          done
-
-          exit 1
-        '''
-      }
-    }
+	stage('Smoke Test') {
+		steps {
+			script {
+				echo "=== Waiting for services to be healthy in Consul ==="
+				def maxRetries = 40
+				def delay = 3
+				
+				for (int i = 1; i <= maxRetries; i++) {
+					def httpHealthy = sh(
+						script: "curl -fsS http://127.0.0.1:8500/v1/health/service/worker-http?passing=true | jq 'length > 0' || echo false",
+						returnStdout: true
+					).trim()
+					
+					def promHealthy = sh(
+						script: "curl -fsS http://127.0.0.1:8500/v1/health/service/worker-prom?passing=true | jq 'length > 0' || echo false",
+						returnStdout: true
+					).trim()
+					
+					if (httpHealthy == "true" && promHealthy == "true") {
+						echo "✅ All services are healthy in Consul!"
+						return
+					}
+					
+					echo "Waiting for healthy services... (${i}/${maxRetries})"
+					sleep(delay)
+				}
+				
+				error("❌ Services did not become healthy in time")
+			}
+		}
+	}
   }
 }
